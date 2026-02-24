@@ -2,9 +2,15 @@ import streamlit as st
 import pandas as pd
 import re
 from io import StringIO
+from pdf2image import convert_from_bytes
+import pytesseract
+from PIL import Image
+
+# Set path to Tesseract executable (update if necessary)
+pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'  # Windows example; adjust for your OS
 
 # ────────────────────────────────────────────────
-# Helper function to parse one BOL text block
+# Helper function to parse one BOL text block (unchanged, but tested on sample BOLs)
 # ────────────────────────────────────────────────
 def parse_bol_text(text_block: str) -> dict | None:
     text = text_block.strip()
@@ -89,13 +95,29 @@ def parse_bol_text(text_block: str) -> dict | None:
 
 
 # ────────────────────────────────────────────────
+# Function to extract text from PDF using OCR
+# ────────────────────────────────────────────────
+def extract_text_from_pdf(pdf_bytes):
+    try:
+        images = convert_from_bytes(pdf_bytes)
+        full_text = ""
+        for page_num, img in enumerate(images, start=1):
+            text = pytesseract.image_to_string(img)
+            full_text += f"--- Page {page_num} ---\n{text}\n"
+        return full_text
+    except Exception as e:
+        st.error(f"Error extracting text from PDF: {e}")
+        return ""
+
+
+# ────────────────────────────────────────────────
 # Main Streamlit App
 # ────────────────────────────────────────────────
 st.title("Inventory Dashboard – Barton Solvents Shipments")
 
 st.markdown("""
-Upload or use the existing **formatted_inventory_sorted.xlsx** as base inventory.  
-Parse incoming **Bills of Lading** (text or future PDF OCR) and append to inventory view.
+Upload your current inventory Excel and drag/drop or upload PDF Bills of Lading.  
+The app will OCR the PDFs, parse shipments, and append to the inventory.
 """)
 
 # 1. Load existing sorted inventory Excel
@@ -116,25 +138,26 @@ else:
 st.subheader("Current Inventory")
 st.dataframe(df_inventory, use_container_width=True)
 
-# 2. Input area for new BOL text (paste multiple blocks)
-st.subheader("Paste Bill(s) of Lading Text")
-bol_text = st.text_area(
-    "Paste full text from one or multiple BOLs here (OCR output or copied text)",
-    height=300,
-    value=""  # you can pre-fill with sample if desired
-)
+# 2. Upload PDFs for new BOLs
+uploaded_pdfs = st.file_uploader("Upload PDF Bill(s) of Lading (supports multiple files)", type=["pdf"], accept_multiple_files=True)
 
-if st.button("Parse & Add to Inventory") and bol_text.strip():
-    # Split into approximate blocks (each BOL starts with FROM: or Straight Bill)
-    blocks = re.split(r'(?=FROM\s*:|Straight\s+Bill\s+of\s+Lading)', bol_text, flags=re.IGNORECASE)
+if uploaded_pdfs:
     new_rows = []
-
-    for block in blocks:
-        if len(block.strip()) < 100:
+    for pdf in uploaded_pdfs:
+        st.info(f"Processing {pdf.name}...")
+        pdf_bytes = pdf.read()
+        bol_text = extract_text_from_pdf(pdf_bytes)
+        if not bol_text:
             continue
-        parsed = parse_bol_text(block)
-        if parsed:
-            new_rows.append(parsed)
+
+        # Split into pages (assuming OCR added --- Page X --- separators)
+        blocks = re.split(r'--- Page \d+ ---', bol_text)
+        for block in blocks:
+            if len(block.strip()) < 100:
+                continue
+            parsed = parse_bol_text(block)
+            if parsed:
+                new_rows.append(parsed)
 
     if new_rows:
         df_new = pd.DataFrame(new_rows)
@@ -148,7 +171,7 @@ if st.button("Parse & Add to Inventory") and bol_text.strip():
         # Append to existing
         df_updated = pd.concat([df_inventory, df_new], ignore_index=True)
 
-        st.success(f"Added {len(new_rows)} new shipment record(s)!")
+        st.success(f"Added {len(new_rows)} new shipment record(s) from PDFs!")
 
         st.subheader("Updated Inventory Preview")
         st.dataframe(df_updated, use_container_width=True)
@@ -162,10 +185,50 @@ if st.button("Parse & Add to Inventory") and bol_text.strip():
             mime="text/csv"
         )
 
-        # Optional: save back to Excel (in memory or local if deployed)
+        # Optional: save back to Excel
         # df_updated.to_excel("updated_inventory.xlsx", index=False)
     else:
-        st.warning("Could not extract usable shipment data from the text. Check formatting.")
+        st.warning("Could not extract usable shipment data from the PDFs. Check if OCR worked or try pasting text manually.")
 
-# Optional future extension: PDF upload + OCR (requires pytesseract or cloud OCR)
-st.info("PDF OCR support coming soon — currently using pasted text only.")
+# Fallback: Paste text if PDF OCR fails
+st.subheader("Or Paste Bill(s) of Lading Text (Fallback)")
+bol_text = st.text_area(
+    "Paste full text from one or multiple BOLs here (OCR output or copied text)",
+    height=300
+)
+
+if st.button("Parse & Add Pasted Text") and bol_text.strip():
+    # Similar parsing logic as before
+    blocks = re.split(r'(?=FROM\s*:|Straight\s+Bill\s+of\s+Lading)', bol_text, flags=re.IGNORECASE)
+    new_rows = []
+    for block in blocks:
+        if len(block.strip()) < 100:
+            continue
+        parsed = parse_bol_text(block)
+        if parsed:
+            new_rows.append(parsed)
+
+    if new_rows:
+        df_new = pd.DataFrame(new_rows)
+        cols_order = ["Unloaded By", "Ship To", "Product", "Quantity", "Packaging", "Lot Numbers", "BOL #", "Notes"]
+        for c in cols_order:
+            if c not in df_new.columns:
+                df_new[c] = ""
+        df_new = df_new[cols_order]
+
+        df_updated = pd.concat([df_inventory, df_new], ignore_index=True)
+
+        st.success(f"Added {len(new_rows)} new shipment record(s)!")
+
+        st.subheader("Updated Inventory Preview")
+        st.dataframe(df_updated, use_container_width=True)
+
+        csv = df_updated.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            label="Download Updated Inventory as CSV",
+            data=csv,
+            file_name="updated_inventory.csv",
+            mime="text/csv"
+        )
+    else:
+        st.warning("Could not extract usable shipment data from the text. Check formatting.")
