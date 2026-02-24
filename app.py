@@ -5,7 +5,7 @@ import pdfplumber
 import re
 from io import BytesIO
 
-# ---------------- OCR availability (safe) ----------------
+# --------------- OCR availability (safe) ---------------
 OCR_AVAILABLE = False
 OCR_REASON = ""
 try:
@@ -16,19 +16,20 @@ except Exception as e:
     OCR_AVAILABLE = False
     OCR_REASON = f"python libs missing ({e.__class__.__name__})"
 
-# ---------------- Streamlit page config ----------------
+# --------------- Streamlit page config ---------------
 st.set_page_config(page_title="BOL → Inventory Extractor", page_icon="📦", layout="wide")
 st.title("📦 Bill of Lading → Inventory Extractor")
 st.caption(
     "Upload one or more BOL PDFs. Outputs a printable Excel with columns: "
     "Unloaded By, Ship To, Product, Quantity, Packaging, Lot Numbers, BOL #, Notes."
 )
-debug_mode = st.checkbox("🔎 Debug Mode (show raw text only for pages that fail)", value=False)
+debug_mode = st.checkbox("🔎 Debug Mode (show raw text for pages that fail BOL detection)", value=False)
 
-# ---------------- Regex helpers ----------------
-CITY_STATE_RE = re.compile(r"([A-Z][A-Za-z .'-]+,\s*[A-Z]{2})")
+# --------------- Regex helpers (single backslashes) ---------------
+CITY_STATE_RE = re.compile(r"([A-Z][A-Za-z .'-]+,\s*[A-Z]{2})\b")
+# Only allow exactly 6 digits for BOL to avoid grabbing ZIP codes like 11207
 BOL_LABELED_RE = re.compile(
-    r"(?:B[\/]?\s*L|BOL)\s*(?:NO\.?|#|NUMBER)?\s*[:\-]?\s*([0-9]{5,7})\b",
+    r"(?:B[\/]?\s*L|BOL)\s*(?:NO\.?|#|NUMBER)?\s*[:\-]?\s*([0-9]{6})\b",
     re.IGNORECASE
 )
 
@@ -42,10 +43,10 @@ def extract_field(pattern, text, default=""):
     return m.group(1).strip() if m else default
 
 # ---------------- Coordinate-aware BOL detection ----------------
-def _find_bol_via_words(page) -> str:
+def find_bol_via_words(page) -> str:
     """
-    Use pdfplumber word coordinates to find the B/L label and then the BOL number
-    to the right (same line) or just below. Return '' if not found.
+    Use pdfplumber word boxes to find the B/L label then the BOL number
+    to the right (same row) or slightly below. Return '' if not found.
     """
     try:
         words = page.extract_words() or []
@@ -55,8 +56,8 @@ def _find_bol_via_words(page) -> str:
     toks = [
         {
             "text": w.get("text", "").strip(),
-            "x0": w.get("x0", 0.0), "x1": w.get("x1", 0.0),
-            "top": w.get("top", 0.0), "bottom": w.get("bottom", 0.0)
+            "x0": float(w.get("x0", 0.0)), "x1": float(w.get("x1", 0.0)),
+            "top": float(w.get("top", 0.0)), "bottom": float(w.get("bottom", 0.0))
         }
         for w in words
     ]
@@ -87,42 +88,37 @@ def _find_bol_via_words(page) -> str:
             t for t in toks
             if (t["top"] > y_bottom and t["top"] <= y_bottom + 2.5 * y_tol)
         ]
+
+        # Only accept exactly 6 digits
         for c in (same_row + below):
-            if re.fullmatch(r"[0-9]{5,7}", c["text"]):
+            if re.fullmatch(r"[0-9]{6}", c["text"]):
                 return c["text"].strip()
 
     return ""
 
-def _guess_bol_from_text(text: str) -> str:
+def guess_bol_from_text(text: str) -> str:
     """
-    Smart fallback: choose a 6-digit ID that appears near B/L or CUST ORDER NUMBER lines,
-    or any 6–7 digit token repeated ≥2 times. Avoid 10-digit phone numbers automatically.
+    Fallback: look in a tight window around B/L or CUST ORDER NUMBER for 6 digits only.
+    If none, pick the most common 6-digit token on the page. Never 5 digits.
     """
-    # 1) Look near explicit labels
-    win = 70
+    win = 60
     for lab in (r"B[\/]?\s*L", r"\bBOL\b", r"CUST(?:OMER)?\s+ORDER\s+NUMBER"):
         for m in re.finditer(lab, text, flags=re.IGNORECASE):
             start = max(0, m.start() - win)
             end = min(len(text), m.end() + win)
             chunk = text[start:end]
-            mnum = re.search(r"\b([0-9]{5,7})\b", chunk)
+            mnum = re.search(r"\b([0-9]{6})\b", chunk)
             if mnum:
                 return mnum.group(1)
 
-    # 2) Frequency vote among 5–7 digit tokens
-    nums = re.findall(r"\b([0-9]{5,7})\b", text)
+    nums = re.findall(r"\b([0-9]{6})\b", text)
     if nums:
         from collections import Counter
-        cnt = Counter(nums)
-        common = cnt.most_common(1)[0]
-        if common[1] >= 2:
-            return common[0]
-        # if nothing repeats, pick the first (still better than empty)
-        return nums[0]
-
+        cnt = Counter(nums).most_common(1)[0]
+        return cnt[0]
     return ""
 
-def _looks_like_product(s: str) -> bool:
+def looks_like_product(s: str) -> bool:
     S = s.upper()
     blocked = (
         S.startswith("FROM:") or S.startswith("AT:") or
@@ -133,26 +129,70 @@ def _looks_like_product(s: str) -> bool:
     )
     return (not blocked) and (2 < len(s) <= 60) and re.search(r"[A-Za-z]", s)
 
-def _ship_to_from(text: str) -> str:
-    # Choose last City, ST that isn't KS and isn't on a FROM/AT/header line.
-    candidates = []
-    for ln in text.split("\n"):
+# --------- Ship To: score candidates & prefer rightmost non-KS destination ---------
+def ship_to_from(page, text: str) -> str:
+    """
+    Score City, ST candidates. Prefer non-KS, not on FROM/AT/header lines.
+    If several tie, choose the rightmost by x0 (dest block tends to be right/upper right).
+    """
+    # Gather candidates by line
+    candidates = []  # (line_text, cityst, line_index)
+    lines = text.split("\n")
+    for i, ln in enumerate(lines):
         ln_clean = ln.strip()
-        for mcs in re.finditer(r"([A-Z][A-Za-z .'-]+,\s*[A-Z]{2})\b", ln_clean):
-            candidates.append((ln_clean, mcs.group(1)))
-    filtered = [cs for (ln, cs) in candidates
-                if not cs.endswith("KS")
-                and not ln.upper().startswith("FROM:")
-                and not ln.upper().startswith("AT:")
-                and "BARTON SOLVENTS, INC." not in ln.upper()
-                and "STRAIGHT BILL OF LADING" not in ln.upper()]
-    if filtered:
-        return filtered[-1].replace("  ", " ").strip()
-    if candidates:
-        return candidates[-1][1].replace("  ", " ").strip()
-    return ""
+        for m in re.finditer(CITY_STATE_RE, ln_clean):
+            candidates.append((ln_clean, m.group(1), i))
 
-def _lot_numbers_from(text: str) -> str:
+    def is_bad_line(ln: str) -> bool:
+        L = ln.upper()
+        return (
+            L.startswith("FROM:") or L.startswith("AT:") or
+            "BARTON SOLVENTS, INC." in L or "STRAIGHT BILL OF LADING" in L
+        )
+
+    # Assign a score to each candidate
+    scored = []
+    for (ln, cs, li) in candidates:
+        score = 0
+        if not cs.endswith("KS"):
+            score += 3  # prefer non-KS
+        if not is_bad_line(ln):
+            score += 2  # avoid origin/header
+        # +1 if line contains "USA" or a ZIP (5 digits), typical of full address blocks
+        if re.search(r"\bUSA\b", ln, re.IGNORECASE) or re.search(r"\b\d{5}(?:-\d{4})?\b", ln):
+            score += 1
+        scored.append((score, ln, cs, li))
+
+    if not scored:
+        return ""
+
+    # Among ties, prefer rightmost (use coordinates if available)
+    best = max(scored, key=lambda x: x[0])
+    best_score = best[0]
+    best_group = [t for t in scored if t[0] == best_score]
+
+    if page is not None and len(best_group) > 1:
+        # Try to disambiguate by x0 position: choose the rightmost on the page
+        try:
+            words = page.extract_words() or []
+        except Exception:
+            words = []
+        def line_x0(ln_text: str) -> float:
+            # approximate: min x0 of all tokens from the line that appear in words
+            xs = []
+            ln_upper = ln_text.upper()
+            for w in words:
+                wt = (w.get("text") or "").upper()
+                if wt and wt in ln_upper:
+                    xs.append(float(w.get("x0", 0.0)))
+            return max(xs) if xs else 0.0  # choose rightmost presence
+        best_group.sort(key=lambda t: line_x0(t[1]), reverse=True)
+        return best_group[0][2].replace("  ", " ").strip()
+
+    # Otherwise, just take the first best candidate
+    return best_group[0][2].replace("  ", " ").strip()
+
+def lot_numbers_from(text: str) -> str:
     lots = re.findall(r"Lot\s*No\.?\s*([A-Za-z0-9\-]+)", text, flags=re.IGNORECASE)
     seen, order = set(), []
     for l in lots:
@@ -161,22 +201,21 @@ def _lot_numbers_from(text: str) -> str:
             order.append(l)
     return "; ".join(order)
 
-def _quantity_from(text: str) -> str:
-    # keep to 1–4 digits; avoids swallowing long part numbers like 1600088
-    qty = extract_field(r"QUANTITY\s*ORDERED\s*([0-9]{1,4})\b", text)
+def quantity_from(text: str) -> str:
+    # BOL pages show small counts like 1, 2, 6, 8, 12, 30, etc.
+    qty = extract_field(r"QUANTITY\s*ORDERED\s*([0-9]{1,3})\b", text)
     if not qty:
-        qty = extract_field(r"Quantity\s*Shipped\s*([0-9]{1,4})\b", text)
+        qty = extract_field(r"Quantity\s*Shipped\s*([0-9]{1,3})\b", text)
     return qty or ""
 
-def _packaging_from(text: str) -> str:
-    # e.g., "435.00 lb DRUM", "2,344.00 lb TOTE", "40.00 lb PAIL", "2.00 lb CAN QT"
+def packaging_from(text: str) -> str:
     m = re.search(
         r"(\d{1,3}(?:,\d{3})*\.\d+\s*lb\s*(?:DRUM|TOTE|PAIL|CAN(?:\s+QT|\s+Gallon)?))",
         text, re.IGNORECASE,
     )
     return m.group(1) if m else ""
 
-def _product_from(text: str) -> str:
+def product_from(text: str) -> str:
     for pat in [
         r"QUANTITY,\s*\(([^)]+)\)",
         r"NOT REGULATED BY DOT,?\s*\(([^)]+)\)",
@@ -185,7 +224,7 @@ def _product_from(text: str) -> str:
         p = extract_field(pat, text)
         if p:
             return p
-    # fallback window: between 'Product' header and 'CUST. NO.'
+    # fallback: between 'Product' and 'CUST. NO.' with filters
     lines = text.split("\n")
     try:
         i_prod = next(i for i, ln in enumerate(lines) if ln.strip().startswith("Product"))
@@ -197,21 +236,21 @@ def _product_from(text: str) -> str:
         i_cust = len(lines)
     for ln in lines[i_prod:i_cust]:
         s = ln.strip()
-        if _looks_like_product(s):
+        if looks_like_product(s):
             return s
     return ""
 
 # ---------------- OCR per page ----------------
-def try_ocr_page_texts(pdf_bytes: bytes):
+def ocr_page_texts(pdf_bytes: bytes):
     if not OCR_AVAILABLE:
         return []
     try:
         images = convert_from_bytes(pdf_bytes, dpi=300)
-        texts = []
+        out = []
         for img in images:
             t = pytesseract.image_to_string(img, config="--psm 6")
-            texts.append(normalize_text(t or ""))
-        return texts
+            out.append(normalize_text(t or ""))
+        return out
     except Exception as e:
         global OCR_REASON
         OCR_REASON = f"OCR runtime error ({e.__class__.__name__}): {e}"
@@ -219,16 +258,16 @@ def try_ocr_page_texts(pdf_bytes: bytes):
 
 # ---------------- Parse one page ----------------
 def parse_page(text: str, page=None, debug_label: str = ""):
-    # 1) BOL: coordinates → labeled regex → smart guess
+    # 1) BOL: coordinates → labeled regex (6 digits) → smart guess (6 digits)
     bol = ""
     if page is not None:
-        bol = _find_bol_via_words(page)
+        bol = find_bol_via_words(page)
     if not bol:
         m = BOL_LABELED_RE.search(text)
         if m:
             bol = m.group(1).strip()
     if not bol:
-        bol = _guess_bol_from_text(text)
+        bol = guess_bol_from_text(text)
 
     if not bol:
         if debug_mode:
@@ -236,12 +275,12 @@ def parse_page(text: str, page=None, debug_label: str = ""):
                 st.code(text)
         return None
 
-    # 2) Remaining fields
-    ship_to = _ship_to_from(text)
-    lot = _lot_numbers_from(text)
-    qty = _quantity_from(text)
-    pack = _packaging_from(text)
-    product = _product_from(text)
+    # 2) Remaining fields (tightened)
+    ship_to = ship_to_from(page, text)
+    lot = lot_numbers_from(text)
+    qty = quantity_from(text)
+    pack = packaging_from(text)
+    product = product_from(text)
 
     return {
         "Unloaded By": "",
@@ -258,7 +297,6 @@ def parse_page(text: str, page=None, debug_label: str = ""):
 def parse_pdf_with_progress(pdf_bytes: bytes, file_label: str, show_overall=None):
     rows = []
 
-    # Native text (and page objects) first
     try:
         with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
             total_pages = len(pdf.pages) or 1
@@ -287,7 +325,7 @@ def parse_pdf_with_progress(pdf_bytes: bytes, file_label: str, show_overall=None
             pbar.progress(0.0, text="Running OCR…")
         except Exception:
             pass
-        ocr_texts = try_ocr_page_texts(pdf_bytes)
+        ocr_texts = ocr_page_texts(pdf_bytes)
         ocr_rows = []
         for i, t in enumerate(ocr_texts, start=1):
             if t:
@@ -318,7 +356,6 @@ if uploaded:
     overall = st.progress(0, text=f"Overall: 0/{total} files")
 
     def bump_overall():
-        # reserved for future per-page updates
         pass
 
     all_rows = []
@@ -336,6 +373,7 @@ if uploaded:
     if all_rows:
         cols = ["Unloaded By","Ship To","Product","Quantity","Packaging","Lot Numbers","BOL #","Notes"]
         df = pd.DataFrame(all_rows, columns=cols)
+
         # Sort by numeric BOL if possible
         try:
             df["__bolnum"] = pd.to_numeric(df["BOL #"], errors="coerce")
