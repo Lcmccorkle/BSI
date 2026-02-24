@@ -22,10 +22,11 @@ st.write(
     "with columns: **Unloaded By, Ship To, Product, Quantity, Packaging, Lot Numbers, BOL #, Notes**."
 )
 
-# ---------- Parsing helpers ----------
+# ---------- Parsing helpers (ALL patterns use single backslashes) ----------
 CITY_STATE_RE = re.compile(r"([A-Z][A-Za-z .'-]+,\s*[A-Z]{2})")
+# Accepts B/L, B L, or BOL; optional NO./#/NUMBER; tolerant separators/newlines; captures next 5+ token
 BOL_BLOCK_RE = re.compile(
-    r"(?:B[\\/]?\\s*L|BOL)\\s*(?:NO\\.?|#|NUMBER)?\\s*[:\\-]?\\s*([0-9A-Z\\-]{5,})",
+    r"(?:B[\/]?\s*L|BOL)\s*(?:NO\.?|#|NUMBER)?\s*[:\-]?\s*([0-9A-Z\-]{5,})",
     re.IGNORECASE
 )
 
@@ -35,7 +36,6 @@ def normalize_text(s: str) -> str:
     return s.strip()
 
 def get_page_count(pdf_bytes: bytes) -> int:
-    """Count pages via pdfplumber (works for both text & scanned PDFs)."""
     try:
         with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
             return len(pdf.pages)
@@ -43,15 +43,12 @@ def get_page_count(pdf_bytes: bytes) -> int:
         return 0
 
 def extract_text_plumber_per_page(pdf_bytes: bytes):
-    """Yield normalized text for each page with generator semantics."""
     with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
             t = page.extract_text() or ""
             yield normalize_text(t)
 
 def try_ocr_page_images(pdf_bytes: bytes):
-    """Yield OCR text per page as images are generated (if OCR available)."""
-    # This will raise if Poppler/Tesseract aren't available; caller catches and disables OCR.
     images = convert_from_bytes(pdf_bytes, dpi=300)
     for img in images:
         t = pytesseract.image_to_string(img, config="--psm 6")
@@ -62,26 +59,27 @@ def extract_field(pattern, text, default=""):
     return m.group(1).strip() if m else default
 
 def parse_page(text: str):
-    # --- BOL # ---
+    # ---- BOL # ----
     bol = ""
     m = BOL_BLOCK_RE.search(text)
     if m:
         bol = m.group(1).strip()
     if not bol:
-        m2 = re.search(r"(?:B[\\/]?\\s*L|BOL)[^\n]{0,80}?(\d{5,})", text, re.IGNORECASE)
+        # Super-fallback: find “B/L” or “BOL” then the next long number on the same block
+        m2 = re.search(r"(?:B[\/]?\s*L|BOL)[^\n]{0,120}?(\d{5,})", text, re.IGNORECASE)
         if m2:
             bol = m2.group(1).strip()
     if not bol:
-        return None
+        return None  # skip page if we can’t identify a BOL
 
-    # --- Ship To (prefer last non-KS to avoid origin address) ---
+    # ---- Ship To (prefer last non-KS match to avoid origin address) ----
     ship_tos = CITY_STATE_RE.findall(text)
     ship_to = ""
     if ship_tos:
         non_ks = [s for s in ship_tos if not s.strip().endswith("KS")]
         ship_to = (non_ks[-1] if non_ks else ship_tos[-1]).replace("  ", " ").strip()
 
-    # --- Lot numbers (can be multiple) ---
+    # ---- Lot Numbers (can be multiple) ----
     lots = re.findall(r"Lot\s*No\.?\s*([A-Za-z0-9\-]+)", text, flags=re.IGNORECASE)
     seen, lot_list = set(), []
     for l in lots:
@@ -90,22 +88,23 @@ def parse_page(text: str):
             lot_list.append(l)
     lot = "; ".join(lot_list)
 
-    # --- Quantity (ordered or shipped) ---
+    # ---- Quantity (Ordered or Shipped) ----
     qty = extract_field(r"QUANTITY\s*ORDERED\s*([0-9,]+)", text)
     if not qty:
         qty = extract_field(r"Quantity\s*Shipped\s*([0-9,]+)", text)
     qty = qty.replace(",", "") if qty else ""
 
-    # --- Packaging (e.g., "435.00 lb DRUM") ---
+    # ---- Packaging (e.g., "435.00 lb DRUM", "2,344.00 lb TOTE", "40.00 lb PAIL", "2.00 lb CAN QT") ----
     pack = ""
     m = re.search(
         r"(\d{1,3}(?:,\d{3})*\.\d+\s*lb\s*(?:DRUM|TOTE|PAIL|CAN(?:\s+QT|\s+Gallon)?))",
-        text, re.IGNORECASE,
+        text,
+        re.IGNORECASE,
     )
     if m:
         pack = m.group(1)
 
-    # --- Product name (prefer parentheses after description lines) ---
+    # ---- Product (prefer parentheses after description lines) ----
     product = ""
     for pat in [
         r"QUANTITY,\s*\(([^)]+)\)",
@@ -116,7 +115,7 @@ def parse_page(text: str):
         if product:
             break
 
-    # Fallback: between 'Product' and 'CUST. NO.'
+    # Fallback: between 'Product' header and 'CUST. NO.'
     if not product:
         lines = text.split("\n")
         try:
@@ -152,7 +151,7 @@ def parse_pdf_with_progress(pdf_bytes: bytes, file_label: str, show_overall=None
     `show_overall` is an optional callback to bump the overall progress.
     """
     rows = []
-    total_pages = get_page_count(pdf_bytes) or 1  # avoid division by zero
+    total_pages = get_page_count(pdf_bytes) or 1
     file_box = st.container()
     file_box.markdown(f"**Processing:** {file_label} · {total_pages} page(s)")
     pbar = file_box.progress(0, text="Reading pages…")
@@ -163,24 +162,21 @@ def parse_pdf_with_progress(pdf_bytes: bytes, file_label: str, show_overall=None
     for i, t in enumerate(extract_text_plumber_per_page(pdf_bytes), start=1):
         native_texts.append(t)
         native_len_sum += len(t)
-        # Try to parse as we go
         if t:
             row = parse_page(t)
             if row:
                 rows.append(row)
-        # Update per-file progress
         pbar.progress(min(i / total_pages, 1.0), text=f"Reading pages… ({i}/{total_pages})")
         if show_overall:
             show_overall()
 
-    # 2) Decide if OCR fallback is worthwhile (only if OCR available)
+    # 2) Auto OCR fallback only if native text looks too small AND OCR is available
     need_ocr = (native_len_sum < 80) and OCR_AVAILABLE
     if need_ocr:
         pbar.progress(0.0, text="Running OCR…")
         try:
             ocr_rows = []
             for i, t in enumerate(try_ocr_page_images(pdf_bytes), start=1):
-                # Parse OCR text per page
                 if t:
                     row = parse_page(t)
                     if row:
@@ -188,16 +184,11 @@ def parse_pdf_with_progress(pdf_bytes: bytes, file_label: str, show_overall=None
                 pbar.progress(min(i / total_pages, 1.0), text=f"OCR {i}/{total_pages}")
                 if show_overall:
                     show_overall()
-
-            # If OCR produced more data than native, prefer OCR result
             if len(ocr_rows) > len(rows):
                 rows = ocr_rows
-
         except Exception as e:
-            # OCR disabled during run; show note but continue with native results
             st.caption(f"⚠️ OCR unavailable for {file_label}. Proceeding with native text only. ({e})")
 
-    # Finalize bar
     pbar.progress(1.0, text="Done")
     return rows
 
@@ -205,14 +196,12 @@ def parse_pdf_with_progress(pdf_bytes: bytes, file_label: str, show_overall=None
 uploaded = st.file_uploader("Upload BOL PDF(s)", type=["pdf"], accept_multiple_files=True)
 
 if uploaded:
-    # Overall progress bar across files (optional, looks nice when many files)
     total_files = len(uploaded)
     done_files = 0
     overall = st.progress(0, text=f"Overall: 0/{total_files} files")
 
     def bump_overall():
-        # Called per page; we only advance on file completion to avoid jitter,
-        # so do nothing here. (Kept for future refinements.)
+        # reserved for per-page overall updates (optional)
         pass
 
     all_rows = []
@@ -224,11 +213,10 @@ if uploaded:
         else:
             st.success(f"✅ Parsed {len(rows)} row(s) from {uf.name}")
             all_rows.extend(rows)
-        # Advance overall on file completion
+
         done_files += 1
         overall.progress(done_files / total_files, text=f"Overall: {done_files}/{total_files} files")
 
-    # Results → Excel
     if all_rows:
         columns = ["Unloaded By","Ship To","Product","Quantity","Packaging","Lot Numbers","BOL #","Notes"]
         df = pd.DataFrame(all_rows, columns=columns)
@@ -258,7 +246,6 @@ if uploaded:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
-    # Informational note about OCR availability
     if not OCR_AVAILABLE:
         st.caption(
             "OCR is disabled unless Python libs + system tools are installed. "
