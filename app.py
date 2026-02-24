@@ -58,26 +58,42 @@ def extract_field(pattern, text, default=""):
     m = re.search(pattern, text, re.IGNORECASE)
     return m.group(1).strip() if m else default
 
+
 def parse_page(text: str):
     # ---- BOL # ----
+    # Require the explicit label and capture only 5–7 digits to avoid phone numbers.
     bol = ""
-    m = BOL_BLOCK_RE.search(text)
+    m = re.search(r"(?:B[\/]?\s*L|BOL)\s*(?:NO\.?|#|NUMBER)?\s*[:\-]?\s*([0-9]{5,7})\b", text, re.IGNORECASE)
     if m:
         bol = m.group(1).strip()
     if not bol:
-        # Super-fallback: find “B/L” or “BOL” then the next long number on the same block
-        m2 = re.search(r"(?:B[\/]?\s*L|BOL)[^\n]{0,120}?(\d{5,})", text, re.IGNORECASE)
+        # Fallback: look within 60 chars of the label for 5–7 digits (still avoids long phone numbers)
+        m2 = re.search(r"(?:B[\/]?\s*L|BOL)[^\n]{0,60}?([0-9]{5,7})\b", text, re.IGNORECASE)
         if m2:
             bol = m2.group(1).strip()
     if not bol:
-        return None  # skip page if we can’t identify a BOL
+        return None  # skip page if we can’t identify a BOL by label
 
-    # ---- Ship To (prefer last non-KS match to avoid origin address) ----
-    ship_tos = CITY_STATE_RE.findall(text)
+    # ---- Ship To ----
+    # Take last non-KS city/state; ignore lines starting with FROM:/AT: to avoid origin/headers.
     ship_to = ""
-    if ship_tos:
-        non_ks = [s for s in ship_tos if not s.strip().endswith("KS")]
-        ship_to = (non_ks[-1] if non_ks else ship_tos[-1]).replace("  ", " ").strip()
+    # Collect candidate city, state tokens with their source lines to allow filtering
+    candidates = []
+    for ln in text.split("\n"):
+        ln_clean = ln.strip()
+        for mcs in re.finditer(r"([A-Z][A-Za-z .'-]+,\s*[A-Z]{2})\b", ln_clean):
+            candidates.append((ln_clean, mcs.group(1)))
+    filtered = [cs for (ln, cs) in candidates
+                if not cs.endswith("KS")
+                and not ln.upper().startswith("FROM:")
+                and not ln.upper().startswith("AT:")
+                and "BARTON SOLVENTS, INC." not in ln.upper()
+                and "STRAIGHT BILL OF LADING" not in ln.upper()]
+    if filtered:
+        ship_to = filtered[-1].replace("  ", " ").strip()
+    elif candidates:
+        # as a last resort, take the last city/state found
+        ship_to = candidates[-1][1].replace("  ", " ").strip()
 
     # ---- Lot Numbers (can be multiple) ----
     lots = re.findall(r"Lot\s*No\.?\s*([A-Za-z0-9\-]+)", text, flags=re.IGNORECASE)
@@ -89,10 +105,10 @@ def parse_page(text: str):
     lot = "; ".join(lot_list)
 
     # ---- Quantity (Ordered or Shipped) ----
-    qty = extract_field(r"QUANTITY\s*ORDERED\s*([0-9,]+)", text)
+    # Only accept 1–4 digits to avoid swallowing long product codes like 1600088.
+    qty = extract_field(r"QUANTITY\s*ORDERED\s*([0-9]{1,4})\b", text)
     if not qty:
-        qty = extract_field(r"Quantity\s*Shipped\s*([0-9,]+)", text)
-    qty = qty.replace(",", "") if qty else ""
+        qty = extract_field(r"Quantity\s*Shipped\s*([0-9]{1,4})\b", text)
 
     # ---- Packaging (e.g., "435.00 lb DRUM", "2,344.00 lb TOTE", "40.00 lb PAIL", "2.00 lb CAN QT") ----
     pack = ""
@@ -115,7 +131,7 @@ def parse_page(text: str):
         if product:
             break
 
-    # Fallback: between 'Product' header and 'CUST. NO.'
+    # Fallback: scan the region between 'Product' and 'CUST. NO.' but ignore headers/legal text.
     if not product:
         lines = text.split("\n")
         try:
@@ -126,11 +142,23 @@ def parse_page(text: str):
             i_cust = next(i for i, ln in enumerate(lines) if "CUST." in ln)
         except StopIteration:
             i_cust = len(lines)
+
+        def looks_like_product(s: str) -> bool:
+            S = s.upper()
+            # Exclude obvious non-product lines
+            blocked = (
+                S.startswith("FROM:") or S.startswith("AT:") or
+                "STRAIGHT BILL OF LADING" in S or
+                "BARTON SOLVENTS, INC." in S or
+                "CARRIER" in S or "DELIVERY" in S or "WAREHOUSE" in S or
+                "QUANTITY" in S or "PACKAGING" in S or "DESCRIPTION" in S
+            )
+            # Keep concise, alphanumeric/hyphen/space names
+            return (not blocked) and (2 < len(s) <= 60) and re.search(r"[A-Za-z]", s)
+
         for ln in lines[i_prod:i_cust]:
             s = ln.strip()
-            if not s or "Transporter" in s or "Destination" in s or s.startswith("#"):
-                continue
-            if re.search(r"[A-Za-z]", s) and 2 < len(s) < 120:
+            if looks_like_product(s):
                 product = s
                 break
 
@@ -138,12 +166,13 @@ def parse_page(text: str):
         "Unloaded By": "",
         "Ship To": ship_to,
         "Product": product,
-        "Quantity": qty,
+        "Quantity": qty or "",
         "Packaging": pack,
         "Lot Numbers": lot,
         "BOL #": bol,
         "Notes": "",
     }
+
 
 def parse_pdf_with_progress(pdf_bytes: bytes, file_label: str, show_overall=None):
     """
@@ -254,3 +283,4 @@ if uploaded:
 
 else:
     st.caption("Drop in your BOL PDFs to get started.")
+
