@@ -1,8 +1,5 @@
 streamlit
 pdfplumber
-pandas
-openpyxl
-pillow
+pymupdf
 pytesseract
-pdf2image
-tesseract
+pillow
